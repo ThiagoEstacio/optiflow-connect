@@ -31,12 +31,12 @@ class ScanRequest(BaseModel):
 
 @management_app.get("/api/devices")
 async def list_devices():
-    if not _registry: raise HTTPException(503, "Not initialized")
+    if _registry is None: raise HTTPException(503, "Not initialized")
     return [{**cfg.model_dump(), "runtime": _driver_manager.get_driver_status(cfg.device_id) if _driver_manager else None} for cfg in _registry.list_devices()]
 
 @management_app.post("/api/devices", status_code=201)
 async def add_device(body: DeviceAddRequest):
-    if not _registry or not _driver_manager: raise HTTPException(503, "Not initialized")
+    if _registry is None or _driver_manager is None: raise HTTPException(503, "Not initialized")
     cfg = DeviceConfig(**body.model_dump())
     await _registry.save_device(cfg)
     if not await _driver_manager.add_device(cfg): raise HTTPException(400, f"Protocolo '{cfg.protocol}' não suportado")
@@ -44,14 +44,14 @@ async def add_device(body: DeviceAddRequest):
 
 @management_app.get("/api/devices/{device_id}")
 async def get_device(device_id: str):
-    if not _registry: raise HTTPException(503, "Not initialized")
+    if _registry is None: raise HTTPException(503, "Not initialized")
     cfg = _registry.get_device(device_id)
     if not cfg: raise HTTPException(404, f"Device '{device_id}' não encontrado")
     return {**cfg.model_dump(), "runtime": _driver_manager.get_driver_status(device_id) if _driver_manager else None}
 
 @management_app.patch("/api/devices/{device_id}/enable")
 async def set_enabled(device_id: str, body: EnableRequest):
-    if not _registry or not _driver_manager: raise HTTPException(503, "Not initialized")
+    if _registry is None or _driver_manager is None: raise HTTPException(503, "Not initialized")
     cfg = _registry.get_device(device_id)
     if not cfg: raise HTTPException(404, f"Device '{device_id}' não encontrado")
     cfg = cfg.model_copy(update={"enabled": body.enabled})
@@ -62,13 +62,13 @@ async def set_enabled(device_id: str, body: EnableRequest):
 
 @management_app.delete("/api/devices/{device_id}", status_code=204)
 async def remove_device(device_id: str):
-    if not _registry or not _driver_manager: raise HTTPException(503, "Not initialized")
+    if _registry is None or _driver_manager is None: raise HTTPException(503, "Not initialized")
     if not await _registry.remove_device(device_id): raise HTTPException(404, f"Device '{device_id}' não encontrado")
     await _driver_manager.remove_device(device_id)
 
 @management_app.get("/api/devices/{device_id}/tags")
 async def list_tags(device_id: str):
-    if not _registry: raise HTTPException(503, "Not initialized")
+    if _registry is None: raise HTTPException(503, "Not initialized")
     cfg = _registry.get_device(device_id)
     if not cfg: raise HTTPException(404, f"Device '{device_id}' não encontrado")
     return [t.model_dump() for t in cfg.tags]
