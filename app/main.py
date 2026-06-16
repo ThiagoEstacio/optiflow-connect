@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import signal
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -40,6 +41,46 @@ GATEWAY_ID  = os.getenv("GATEWAY_ID",  "optiflow-gateway-01")
 DB_PATH     = os.getenv("DEVICES_DB",  "/app/data/devices.db")
 MGMT_PORT   = int(os.getenv("MGMT_PORT", "8080"))
 HEALTH_FILE = Path(os.getenv("HEALTH_FILE", "/app/data/gateway.health"))
+
+# Watchdog-timer de software: limiar e cadência (configuráveis).
+WATCHDOG_STUCK_S = float(os.getenv("WATCHDOG_STUCK_S", "30"))
+WATCHDOG_CHECK_S = float(os.getenv("WATCHDOG_CHECK_S", "5"))
+
+# Batimento do event loop. Atualizado por _liveness_beat (no loop) e lido pela
+# thread de SO _loop_watchdog (fora do loop).
+_LIVENESS = {"ts": time.monotonic()}
+
+
+async def _liveness_beat(interval_s: float = 2.0) -> None:
+    """Marca que o event loop está vivo e progredindo."""
+    while True:
+        _LIVENESS["ts"] = time.monotonic()
+        await asyncio.sleep(interval_s)
+
+
+def _start_loop_watchdog() -> None:
+    """Watchdog-timer em software (padrão de watchdog de hardware).
+
+    Uma thread de SO — que continua rodando mesmo se o event loop asyncio
+    travar — vigia o batimento do loop. Se o loop não avança por
+    WATCHDOG_STUCK_S, o processo é MORTO (os._exit) e o Docker o reinicia via
+    `restart: unless-stopped`. Converte um hang silencioso (que mantinha o
+    container "vivo" mas congelado) em recuperação determinística e rápida,
+    sem depender de watchdog externo nem do socket do Docker.
+    """
+    def _run() -> None:
+        while True:
+            time.sleep(WATCHDOG_CHECK_S)
+            lag = time.monotonic() - _LIVENESS["ts"]
+            if lag > WATCHDOG_STUCK_S:
+                log.critical(
+                    "gateway.loop_stuck lag=%.1fs > %.0fs — os._exit(1) p/ Docker reiniciar",
+                    lag, WATCHDOG_STUCK_S,
+                )
+                os._exit(1)
+
+    threading.Thread(target=_run, name="loop-watchdog", daemon=True).start()
+    log.info("gateway.loop_watchdog_armado stuck_after=%.0fs check=%.0fs", WATCHDOG_STUCK_S, WATCHDOG_CHECK_S)
 
 
 async def _health_loop(
@@ -91,6 +132,10 @@ async def main() -> None:
     cmd_consumer = CommandConsumer(bus, driver_manager)
     init_api(registry, driver_manager)
 
+    # Watchdog-timer interno: mata o processo se o event loop travar -> Docker
+    # reinicia. Defesa primária contra o hang intermitente do gateway.
+    _start_loop_watchdog()
+
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -98,6 +143,7 @@ async def main() -> None:
         loop.add_signal_handler(sig, lambda: stop_event.set())
 
     tasks = [
+        asyncio.create_task(_liveness_beat(),      name="liveness"),
         asyncio.create_task(cmd_consumer.run(),    name="cmd-consumer"),
         asyncio.create_task(_run_management_api(), name="mgmt-api"),
         asyncio.create_task(_health_loop(driver_manager), name="health"),
