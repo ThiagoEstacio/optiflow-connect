@@ -32,7 +32,17 @@ class GatewayBus:
         self._redis: aioredis.Redis | None = None
 
     async def connect(self) -> None:
-        self._redis = aioredis.from_url(self._url, decode_responses=True)
+        # health_check_interval + retry: o cliente revalida a conexão
+        # periodicamente e reconecta sozinho após blip/restart do redis,
+        # em vez de falhar em silêncio.
+        self._redis = aioredis.from_url(
+            self._url,
+            decode_responses=True,
+            health_check_interval=15,
+            socket_keepalive=True,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+        )
         await self._redis.ping()
         await self._ensure_groups()
         log.info("gateway_bus.connected", extra={"redis": self._url})

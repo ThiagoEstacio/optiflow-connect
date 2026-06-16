@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -41,11 +42,31 @@ MGMT_PORT   = int(os.getenv("MGMT_PORT", "8080"))
 HEALTH_FILE = Path(os.getenv("HEALTH_FILE", "/app/data/gateway.health"))
 
 
-async def _health_loop(interval_s: float = 10.0) -> None:
+async def _health_loop(
+    driver_manager: DriverManager,
+    interval_s: float = 10.0,
+    stale_after_s: float = 90.0,
+) -> None:
+    """Liveness HONESTA: o arquivo de saúde só é mantido fresco enquanto o
+    gateway está de fato PUBLICANDO. Se a ingestão estola (loop preso, drivers
+    mortos), published_total para de avançar -> paramos de tocar o arquivo ->
+    ele envelhece -> o healthcheck (que checa mtime) marca unhealthy.
+    Acaba com o 'verde mentiroso' (antes tocava incondicionalmente)."""
     HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HEALTH_FILE.touch()  # satisfaz o start_period
+    last_total = -1
+    last_progress = time.monotonic()
     while True:
-        HEALTH_FILE.touch()
         await asyncio.sleep(interval_s)
+        total = driver_manager.status().get("published_total", 0)
+        now = time.monotonic()
+        if total != last_total:
+            last_total = total
+            last_progress = now
+        if now - last_progress < stale_after_s:
+            HEALTH_FILE.touch()
+        else:
+            log.warning("gateway.health_stale published_total parado há %.0fs", now - last_progress)
 
 
 async def _run_management_api() -> None:
@@ -79,7 +100,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(cmd_consumer.run(),    name="cmd-consumer"),
         asyncio.create_task(_run_management_api(), name="mgmt-api"),
-        asyncio.create_task(_health_loop(),        name="health"),
+        asyncio.create_task(_health_loop(driver_manager), name="health"),
     ]
 
     stop_task = asyncio.create_task(stop_event.wait(), name="stop")
