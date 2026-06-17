@@ -12,10 +12,11 @@ management_app = FastAPI(title="OptiFlow Connect", version="2.0.0")
 management_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _registry: DeviceRegistry | None = None
 _driver_manager = None
+_channel = None
 
-def init_api(registry: DeviceRegistry, driver_manager) -> None:
-    global _registry, _driver_manager
-    _registry = registry; _driver_manager = driver_manager
+def init_api(registry: DeviceRegistry, driver_manager, channel=None) -> None:
+    global _registry, _driver_manager, _channel
+    _registry = registry; _driver_manager = driver_manager; _channel = channel
 
 class DeviceAddRequest(BaseModel):
     device_id: str; device_type: str; protocol: str; endpoint: str
@@ -107,9 +108,18 @@ async def health():
     st = _driver_manager.status()
     connected = sum(1 for d in st["drivers"].values() if d.get("status") == "connected")
     total = len(st["drivers"])
+    # com o channel ligado, a ingestão MQTT vem dele (não dos drivers por-device)
+    if _channel is not None:
+        return {"status": "ok", "channel": _channel.stats(), "connected": connected, "total": total}
     return {"status": "ok" if connected == total else ("degraded" if connected else "error"), "connected": connected, "total": total}
 
 @management_app.get("/api/stats")
 async def stats():
     if not _driver_manager: raise HTTPException(503, "Not initialized")
-    return _driver_manager.status()
+    st = _driver_manager.status()
+    if _channel is not None:
+        ch = _channel.stats()
+        # published_total inclui o channel — o watchdog externo o monitora
+        st["published_total"] = st.get("published_total", 0) + ch.get("published", 0)
+        st["channel"] = ch
+    return st

@@ -28,6 +28,7 @@ from .core.bus import GatewayBus
 from .core.registry import DeviceRegistry
 from .services.driver_manager import DriverManager
 from .services.command_consumer import CommandConsumer
+from .services.channel_consumer import ChannelConsumer
 from .api.app import management_app, init_api
 
 logging.basicConfig(
@@ -41,6 +42,14 @@ GATEWAY_ID  = os.getenv("GATEWAY_ID",  "optiflow-gateway-01")
 DB_PATH     = os.getenv("DEVICES_DB",  "/app/data/devices.db")
 MGMT_PORT   = int(os.getenv("MGMT_PORT", "8080"))
 HEALTH_FILE = Path(os.getenv("HEALTH_FILE", "/app/data/gateway.health"))
+
+# Channel model (KEPServer-style): 1 conexão : N tags via wildcard. Ligado por
+# padrão (escala). Para HA horizontal, use MQTT_CHANNEL_TOPIC com shared
+# subscription: $share/<grupo>/optiflow/# e rode N réplicas do gateway.
+MQTT_CHANNEL_ENABLED = os.getenv("MQTT_CHANNEL_ENABLED", "1") == "1"
+MQTT_CHANNEL_HOST    = os.getenv("MQTT_CHANNEL_HOST", "mosquitto")
+MQTT_CHANNEL_PORT    = int(os.getenv("MQTT_CHANNEL_PORT", "1883"))
+MQTT_CHANNEL_TOPIC   = os.getenv("MQTT_CHANNEL_TOPIC", "optiflow/#")
 
 # Watchdog-timer de software: limiar e cadência (configuráveis).
 WATCHDOG_STUCK_S = float(os.getenv("WATCHDOG_STUCK_S", "30"))
@@ -84,7 +93,7 @@ def _start_loop_watchdog() -> None:
 
 
 async def _health_loop(
-    driver_manager: DriverManager,
+    progress_fn,
     interval_s: float = 10.0,
     stale_after_s: float = 90.0,
 ) -> None:
@@ -99,7 +108,7 @@ async def _health_loop(
     last_progress = time.monotonic()
     while True:
         await asyncio.sleep(interval_s)
-        total = driver_manager.status().get("published_total", 0)
+        total = progress_fn()
         now = time.monotonic()
         if total != last_total:
             last_total = total
@@ -127,10 +136,26 @@ async def main() -> None:
     await registry.load()
 
     driver_manager = DriverManager(bus, registry, gateway_id=GATEWAY_ID)
-    await driver_manager.start()
+    # Com o channel ligado, o MQTT é ingerido por UMA conexão (ChannelConsumer);
+    # os drivers MQTT por-device são pulados (sem dupla-ingestão). Demais
+    # protocolos (opcua/modbus/...) seguem pelo DriverManager.
+    await driver_manager.start(exclude_protocols={"mqtt"} if MQTT_CHANNEL_ENABLED else set())
+
+    channel: ChannelConsumer | None = None
+    if MQTT_CHANNEL_ENABLED:
+        channel = ChannelConsumer(
+            bus, gateway_id=GATEWAY_ID,
+            host=MQTT_CHANNEL_HOST, port=MQTT_CHANNEL_PORT, topic=MQTT_CHANNEL_TOPIC,
+        )
+        await channel.start()
 
     cmd_consumer = CommandConsumer(bus, driver_manager)
-    init_api(registry, driver_manager)
+    init_api(registry, driver_manager, channel=channel)
+
+    # progresso de publicação = drivers (não-MQTT) + channel (MQTT). Alimenta o
+    # health-check honesto.
+    def _progress() -> int:
+        return driver_manager.status().get("published_total", 0) + (channel.published if channel else 0)
 
     # Watchdog-timer interno: mata o processo se o event loop travar -> Docker
     # reinicia. Defesa primária contra o hang intermitente do gateway.
@@ -146,7 +171,7 @@ async def main() -> None:
         asyncio.create_task(_liveness_beat(),      name="liveness"),
         asyncio.create_task(cmd_consumer.run(),    name="cmd-consumer"),
         asyncio.create_task(_run_management_api(), name="mgmt-api"),
-        asyncio.create_task(_health_loop(driver_manager), name="health"),
+        asyncio.create_task(_health_loop(_progress), name="health"),
     ]
 
     stop_task = asyncio.create_task(stop_event.wait(), name="stop")

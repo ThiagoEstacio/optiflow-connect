@@ -64,11 +64,13 @@ class DriverManager:
         self._published_total = 0
         self._errors_total    = 0
 
-    async def start(self) -> None:
-        devices = self._registry.list_devices()
+    async def start(self, exclude_protocols: set[str] | None = None) -> None:
+        exclude = exclude_protocols or set()
+        devices = [d for d in self._registry.list_devices() if d.protocol not in exclude]
         if not devices:
-            from ..drivers.simulator import DEFAULT_SIM_CONFIG
-            await self.add_device(DEFAULT_SIM_CONFIG)
+            if not exclude:
+                from ..drivers.simulator import DEFAULT_SIM_CONFIG
+                await self.add_device(DEFAULT_SIM_CONFIG)
         else:
             for cfg in devices:
                 if cfg.enabled:
