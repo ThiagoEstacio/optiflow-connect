@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections import deque
 from datetime import datetime, timezone
 
@@ -27,6 +28,12 @@ from ..core.bus import GatewayBus
 from ..core.schemas import GatewayReading
 
 log = logging.getLogger(__name__)
+
+# Store-and-forward DURÁVEL: snapshot do backlog num arquivo (no volume), p/
+# sobreviver a restart do gateway durante uma queda do sink — não só blip em
+# memória. Caminho no /app/data (gateway_data volume).
+SPILL_PATH = os.getenv("CHANNEL_SPILL_PATH", "/app/data/channel_spill.jsonl")
+SNAPSHOT_INTERVAL_S = float(os.getenv("CHANNEL_SNAPSHOT_S", "3"))
 
 
 def _device_type(device_id: str) -> str:
@@ -68,9 +75,20 @@ class ChannelConsumer:
         self.published = 0
         self.dropped = 0
         self.requeued = 0
+        self.replayed = 0
+        self._spill_exists = False
         self._devices: set[str] = set()  # auto-discovery
 
     async def start(self) -> None:
+        # Replay do spill durável: dado bufferizado num restart durante queda do
+        # sink é re-injetado p/ não se perder.
+        replay = await asyncio.to_thread(self._load_snapshot)
+        if replay:
+            self._buf.extendleft(reversed(replay))
+            self.replayed = len(replay)
+            self._spill_exists = True
+            log.info("channel_consumer.replayed_from_spill n=%d", len(replay))
+
         client = mqtt.Client(client_id=f"optiflow-channel-{self._gateway_id}")
         client.on_connect = self._on_connect
         client.on_message = self._on_message
@@ -79,7 +97,50 @@ class ChannelConsumer:
         client.loop_start()
         self._client = client
         asyncio.create_task(self._flush_loop(), name="channel-flush")
+        asyncio.create_task(self._snapshot_loop(), name="channel-snapshot")
         log.info("channel_consumer.started host=%s topic=%s", self._host, self._topic)
+
+    # ── store-and-forward durável (snapshot do backlog em disco) ───────────────
+    def _write_snapshot(self, entries: list[dict]) -> None:
+        tmp = SPILL_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        os.replace(tmp, SPILL_PATH)  # atômico
+
+    def _clear_snapshot(self) -> None:
+        try:
+            os.remove(SPILL_PATH)
+        except FileNotFoundError:
+            pass
+
+    def _load_snapshot(self) -> list[GatewayReading]:
+        if not os.path.exists(SPILL_PATH):
+            return []
+        out: list[GatewayReading] = []
+        with open(SPILL_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(GatewayReading.from_stream_entry(json.loads(line)))
+                except Exception:  # noqa: BLE001
+                    pass
+        return out
+
+    async def _snapshot_loop(self) -> None:
+        """Espelha o backlog em disco. Vazio → remove o arquivo (operação
+        normal não toca disco além de 1 checagem)."""
+        while True:
+            await asyncio.sleep(SNAPSHOT_INTERVAL_S)
+            if self._buf:
+                snapshot = [r.to_stream_entry() for r in list(self._buf)]
+                await asyncio.to_thread(self._write_snapshot, snapshot)
+                self._spill_exists = True
+            elif self._spill_exists:
+                await asyncio.to_thread(self._clear_snapshot)
+                self._spill_exists = False
 
     def _on_connect(self, cl: mqtt.Client, _ud, _flags, rc: int) -> None:
         if rc == 0:
@@ -141,7 +202,9 @@ class ChannelConsumer:
             "published": self.published,
             "dropped": self.dropped,
             "requeued": self.requeued,
+            "replayed": self.replayed,
             "buffered": len(self._buf),
+            "spill_active": self._spill_exists,
             "devices_discovered": len(self._devices),
         }
 
