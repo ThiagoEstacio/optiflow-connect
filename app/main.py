@@ -51,6 +51,13 @@ MQTT_CHANNEL_HOST    = os.getenv("MQTT_CHANNEL_HOST", "mosquitto")
 MQTT_CHANNEL_PORT    = int(os.getenv("MQTT_CHANNEL_PORT", "1883"))
 MQTT_CHANNEL_TOPIC   = os.getenv("MQTT_CHANNEL_TOPIC", "optiflow/#")
 
+# OPC-UA auto-discovery: used by the OPERA simulator/SCADA path. When set, the
+# gateway browses the server and registers discovered devices before polling.
+OPCUA_AUTODISCOVERY_ENDPOINT = os.getenv("OPCUA_AUTODISCOVERY_ENDPOINT", "")
+OPCUA_AUTODISCOVERY_DEPTH    = int(os.getenv("OPCUA_AUTODISCOVERY_DEPTH", "2"))
+OPCUA_AUTODISCOVERY_ATTEMPTS = int(os.getenv("OPCUA_AUTODISCOVERY_ATTEMPTS", "30"))
+OPCUA_AUTODISCOVERY_RETRY_S  = float(os.getenv("OPCUA_AUTODISCOVERY_RETRY_S", "2"))
+
 # Watchdog-timer de software: limiar e cadência (configuráveis).
 WATCHDOG_STUCK_S = float(os.getenv("WATCHDOG_STUCK_S", "30"))
 WATCHDOG_CHECK_S = float(os.getenv("WATCHDOG_CHECK_S", "5"))
@@ -90,6 +97,36 @@ def _start_loop_watchdog() -> None:
 
     threading.Thread(target=_run, name="loop-watchdog", daemon=True).start()
     log.info("gateway.loop_watchdog_armado stuck_after=%.0fs check=%.0fs", WATCHDOG_STUCK_S, WATCHDOG_CHECK_S)
+
+
+async def _bootstrap_opcua_discovery(registry: DeviceRegistry) -> int:
+    if not OPCUA_AUTODISCOVERY_ENDPOINT:
+        return 0
+
+    from .discovery.opcua import OpcUaScanner
+
+    scanner = OpcUaScanner()
+    for attempt in range(1, OPCUA_AUTODISCOVERY_ATTEMPTS + 1):
+        devices = await scanner.scan(OPCUA_AUTODISCOVERY_ENDPOINT, max_depth=OPCUA_AUTODISCOVERY_DEPTH)
+        if devices:
+            for cfg in devices:
+                await registry.save_device(cfg)
+            log.info(
+                "gateway.opcua_autodiscovery.registered endpoint=%s devices=%d attempt=%d",
+                OPCUA_AUTODISCOVERY_ENDPOINT,
+                len(devices),
+                attempt,
+            )
+            return len(devices)
+        log.warning(
+            "gateway.opcua_autodiscovery.empty endpoint=%s attempt=%d/%d",
+            OPCUA_AUTODISCOVERY_ENDPOINT,
+            attempt,
+            OPCUA_AUTODISCOVERY_ATTEMPTS,
+        )
+        await asyncio.sleep(OPCUA_AUTODISCOVERY_RETRY_S)
+    log.error("gateway.opcua_autodiscovery.failed endpoint=%s", OPCUA_AUTODISCOVERY_ENDPOINT)
+    return 0
 
 
 async def _health_loop(
@@ -134,6 +171,7 @@ async def main() -> None:
 
     registry = DeviceRegistry(db_path=DB_PATH)
     await registry.load()
+    await _bootstrap_opcua_discovery(registry)
 
     driver_manager = DriverManager(bus, registry, gateway_id=GATEWAY_ID)
     # Com o channel ligado, o MQTT é ingerido por UMA conexão (ChannelConsumer);
