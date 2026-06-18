@@ -67,6 +67,7 @@ class ChannelConsumer:
         self.received = 0
         self.published = 0
         self.dropped = 0
+        self.requeued = 0
         self._devices: set[str] = set()  # auto-discovery
 
     async def start(self) -> None:
@@ -124,7 +125,14 @@ class ChannelConsumer:
                     await self._bus.publish_readings_batch(batch)
                     self.published += len(batch)
                 except Exception as e:  # noqa: BLE001 — não derruba a ingestão
-                    log.error("channel_consumer.publish_error err=%s", e)
+                    # Store-and-forward (estilo KEPServer): o sink falhou (ex.:
+                    # redis em blip) -> re-enfileira o lote (NÃO perde dado) e
+                    # tenta de novo. A ordem não importa: cada reading carrega
+                    # seu próprio ts. Limitado por maxlen do deque.
+                    self._buf.extendleft(reversed(batch))
+                    self.requeued += len(batch)
+                    log.error("channel_consumer.publish_error err=%s re-enfileirado=%d buffered=%d",
+                              e, len(batch), len(self._buf))
                     await asyncio.sleep(1)
 
     def stats(self) -> dict:
@@ -132,6 +140,7 @@ class ChannelConsumer:
             "received": self.received,
             "published": self.published,
             "dropped": self.dropped,
+            "requeued": self.requeued,
             "buffered": len(self._buf),
             "devices_discovered": len(self._devices),
         }
