@@ -20,7 +20,7 @@ class OpcUaScanner(DiscoveryScanner):
                         if name == "Server": continue
                         tags = await _browse_variables(node, client, max_depth)
                         if tags:
-                            devices.append(DeviceConfig(device_id=name, device_type="SENSOR", protocol="opcua", endpoint=url, tags=tags, discovery_source=f"opcua:{url}", created_at=datetime.now(timezone.utc)))
+                            devices.append(DeviceConfig(device_id=name, device_type=_device_type(name), protocol="opcua", endpoint=url, tags=tags, discovery_source=f"opcua:{url}", created_at=datetime.now(timezone.utc)))
                     except Exception:
                         pass
         except Exception as e:
@@ -39,7 +39,21 @@ async def _browse_variables(node, client, depth: int) -> list[TagConfig]:
                     name = (await child.read_display_name()).Text
                     dv   = await child.read_data_value()
                     float(dv.Value.Value)
-                    tags.append(TagConfig(tag_id=name, address=child.nodeid.to_string()))
+                    tags.append(TagConfig(
+                        tag_id=name,
+                        address=child.nodeid.to_string(),
+                        writable=name in {
+                            "sp_cmd",
+                            "pos",
+                            "pump_state",
+                            "mode",
+                            "pump_mode_cmd",
+                            "pump_1_cmd",
+                            "pump_2_cmd",
+                            "pump_3_cmd",
+                            "q_in_setpoint_cmd",
+                        },
+                    ))
                 except (TypeError, ValueError):
                     pass
             elif nc == ua.NodeClass.Object:
@@ -47,3 +61,13 @@ async def _browse_variables(node, client, depth: int) -> list[TagConfig]:
     except Exception:
         pass
     return tags
+
+
+def _device_type(device_id: str) -> str:
+    if device_id.startswith("VRP-"):
+        return "VRP"
+    if device_id.startswith("CRAT-"):
+        return "RESERVOIR"
+    if device_id.startswith("MM-"):
+        return "MACROMETER"
+    return "SENSOR"

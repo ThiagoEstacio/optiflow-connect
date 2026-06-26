@@ -29,6 +29,8 @@ class ProtocolDriver(ABC):
         self._last_error: str | None = None
         self._read_count  = 0
         self._error_count = 0
+        self._last_success_at: datetime | None = None
+        self._last_failure_at: datetime | None = None
 
     @abstractmethod
     async def connect(self) -> None: ...
@@ -65,6 +67,8 @@ class ProtocolDriver(ABC):
             "read_count":   self._read_count,
             "error_count":  self._error_count,
             "tag_count":    len(self.cfg.tags),
+            "last_success_at": self._last_success_at.isoformat() if self._last_success_at else None,
+            "last_failure_at": self._last_failure_at.isoformat() if self._last_failure_at else None,
         }
 
     def _make_reading(self, tag: TagConfig, value: float, quality: str = "good", ts: datetime | None = None) -> GatewayReading:

@@ -39,6 +39,7 @@ class OpcUaDriver(ProtocolDriver):
     async def read_all(self) -> list[GatewayReading]:
         now = datetime.now(timezone.utc)
         readings = []
+        failures = 0
         for tag in self.cfg.tags:
             try:
                 node = self._client.get_node(tag.address)
@@ -51,9 +52,20 @@ class OpcUaDriver(ProtocolDriver):
                 readings.append(self._make_reading(tag, raw, quality=quality, ts=ts))
                 self._read_count += 1
             except Exception as e:
+                failures += 1
                 self._error_count += 1
                 self._last_error = str(e)
+                self._last_failure_at = now
                 readings.append(self._make_bad_reading(tag))
+        if self.cfg.tags and failures == len(self.cfg.tags):
+            self._status = DriverStatus.ERROR
+            await self.disconnect()
+            raise ConnectionError(
+                f"opcua all tags failed for {self.cfg.device_id}; forcing reconnect"
+            )
+        if failures == 0:
+            self._last_error = None
+            self._last_success_at = now
         return readings
 
     async def write_tag(self, tag_id: str, value: float) -> bool:
@@ -64,7 +76,7 @@ class OpcUaDriver(ProtocolDriver):
             from asyncua import ua
             node = self._client.get_node(tag.address)
             raw  = (value - tag.offset) / tag.scale
-            await node.write_value(ua.DataValue(ua.Variant(float(raw), ua.VariantType.Float)))
+            await node.write_value(ua.DataValue(ua.Variant(float(raw), ua.VariantType.Double)))
             return True
         except Exception as e:
             log.error("opcua.write_error", extra={"device_id": self.cfg.device_id, "error": str(e)})

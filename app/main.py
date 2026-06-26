@@ -59,7 +59,7 @@ OPCUA_AUTODISCOVERY_ATTEMPTS = int(os.getenv("OPCUA_AUTODISCOVERY_ATTEMPTS", "30
 OPCUA_AUTODISCOVERY_RETRY_S  = float(os.getenv("OPCUA_AUTODISCOVERY_RETRY_S", "2"))
 
 # Watchdog-timer de software: limiar e cadência (configuráveis).
-WATCHDOG_STUCK_S = float(os.getenv("WATCHDOG_STUCK_S", "30"))
+WATCHDOG_STUCK_S = float(os.getenv("WATCHDOG_STUCK_S", "0"))
 WATCHDOG_CHECK_S = float(os.getenv("WATCHDOG_CHECK_S", "5"))
 
 # Batimento do event loop. Atualizado por _liveness_beat (no loop) e lido pela
@@ -84,6 +84,10 @@ def _start_loop_watchdog() -> None:
     container "vivo" mas congelado) em recuperação determinística e rápida,
     sem depender de watchdog externo nem do socket do Docker.
     """
+    if WATCHDOG_STUCK_S <= 0:
+        log.info("gateway.loop_watchdog_disabled")
+        return
+
     def _run() -> None:
         while True:
             time.sleep(WATCHDOG_CHECK_S)
